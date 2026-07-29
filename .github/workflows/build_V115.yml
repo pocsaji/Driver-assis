@@ -1,0 +1,434 @@
+name: Build TomTom Kiszolgalo V115
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Recreate V113 project from the last stable workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pyyaml
+          python <<'PY'
+          from pathlib import Path
+          import yaml
+
+          candidates = [
+              path for path in Path('.').rglob('build_V113.yml')
+              if '.git' not in path.parts
+          ]
+          if not candidates:
+              raise SystemExit(
+                  'A build_V113.yml nem található. A V115-et a V113 mellé kell feltölteni.'
+              )
+
+          previous = candidates[0]
+          data = yaml.safe_load(previous.read_text(encoding='utf-8'))
+          steps = data.get('jobs', {}).get('build', {}).get('steps', [])
+          create_step = None
+          for step in steps:
+              name = str(step.get('name', ''))
+              run = step.get('run')
+              if run and 'Create TomTom Kiszolgalo V113' in name:
+                  create_step = run
+                  break
+          if not create_step:
+              raise SystemExit(
+                  'A V113 projekt-létrehozó lépése nem található a build_V113.yml fájlban.'
+              )
+
+          Path('/tmp/create_v113_project.sh').write_text(
+              'set -euo pipefail\n' + create_step + '\n',
+              encoding='utf-8'
+          )
+          print(f'V113 alapforrás: {previous}')
+          PY
+          bash /tmp/create_v113_project.sh
+
+      - name: Upgrade V113 to V115 and send real stops instead of syncing a track
+        shell: bash
+        run: |
+          set -euo pipefail
+          python <<'PY'
+          from pathlib import Path
+          import re
+
+          project_files = [
+              Path('settings.gradle.kts'),
+              Path('app/build.gradle.kts'),
+              Path('app/src/main/AndroidManifest.xml'),
+              Path('app/src/main/res/values/strings.xml'),
+          ]
+          project_files += list(Path('app/src/main/java').rglob('*.java'))
+
+          for path in project_files:
+              if not path.exists():
+                  continue
+              source = path.read_text(encoding='utf-8')
+              source = source.replace('V113', 'V115')
+              source = source.replace('TomTomKiszolgaloV113', 'TomTomKiszolgaloV115')
+              source = re.sub(r'\bversionCode\s*=\s*113\b',
+                              'versionCode = 115', source)
+              source = re.sub(r'\bversionName\s*=\s*"113"',
+                              'versionName = "115"', source)
+              path.write_text(source, encoding='utf-8')
+
+
+          web_path = Path(
+              'app/src/main/java/hu/pocsaji/tomtomkiszolgalo/TomTomWebActivity.java'
+          )
+          web = web_path.read_text(encoding='utf-8')
+
+          def replace_method(source: str, signature: str, replacement: str) -> str:
+              start = source.find(signature)
+              if start < 0:
+                  raise SystemExit(f'Nem található metódus: {signature}')
+              opening = source.find('{', start)
+              if opening < 0:
+                  raise SystemExit(f'Nem található metódustörzs: {signature}')
+              depth = 0
+              closing = -1
+              in_string = False
+              escaped = False
+              in_char = False
+              line_comment = False
+              block_comment = False
+              i = opening
+              while i < len(source):
+                  ch = source[i]
+                  nxt = source[i + 1] if i + 1 < len(source) else ''
+                  if line_comment:
+                      if ch == '\n':
+                          line_comment = False
+                      i += 1
+                      continue
+                  if block_comment:
+                      if ch == '*' and nxt == '/':
+                          block_comment = False
+                          i += 2
+                          continue
+                      i += 1
+                      continue
+                  if in_string:
+                      if escaped:
+                          escaped = False
+                      elif ch == '\\':
+                          escaped = True
+                      elif ch == '"':
+                          in_string = False
+                      i += 1
+                      continue
+                  if in_char:
+                      if escaped:
+                          escaped = False
+                      elif ch == '\\':
+                          escaped = True
+                      elif ch == "'":
+                          in_char = False
+                      i += 1
+                      continue
+                  if ch == '/' and nxt == '/':
+                      line_comment = True
+                      i += 2
+                      continue
+                  if ch == '/' and nxt == '*':
+                      block_comment = True
+                      i += 2
+                      continue
+                  if ch == '"':
+                      in_string = True
+                      i += 1
+                      continue
+                  if ch == "'":
+                      in_char = True
+                      i += 1
+                      continue
+                  if ch == '{':
+                      depth += 1
+                  elif ch == '}':
+                      depth -= 1
+                      if depth == 0:
+                          closing = i
+                          break
+                  i += 1
+              if closing < 0:
+                  raise SystemExit(f'Nem zárható le metódus: {signature}')
+              return source[:start] + replacement.rstrip() + source[closing + 1:]
+
+          new_wait_for_imported_route = r'''
+              private void waitForImportedRoute(
+                      int generation,
+                      int attempt) {
+                  if (!isCurrentMenuAutomation(generation)) {
+                      return;
+                  }
+                  if (generatedRouteName.isBlank()) {
+                      failMenuAutomation(
+                              generation,
+                              "Az importált útvonal neve nem érkezett meg.");
+                      return;
+                  }
+
+                  statusText.setText(
+                          "GPX feltöltve; az importált útvonal megnyitása.");
+                  webView.evaluateJavascript(
+                          buildImportedRouteOptionsClickScript(
+                                  generatedRouteName),
+                          result -> {
+                              if (!isCurrentMenuAutomation(generation)) {
+                                  return;
+                              }
+                              if (result != null &&
+                                      (result.contains("ROUTE_OPTIONS_CLICKED") ||
+                                       result.contains("ROUTE_ROW_CLICKED"))) {
+                                  statusText.setText(
+                                          "Az importált útvonal megnyílt; " +
+                                                  "átalakítás valódi TomTom-megállókká.");
+                                  webView.postDelayed(
+                                          () -> waitForImportedRouteEdit(
+                                                  generation),
+                                          AFTER_IMPORTED_ROUTE_MS);
+                                  return;
+                              }
+
+                              int nextAttempt = attempt + 1;
+                              if (nextAttempt < UI_STEP_MAX_ATTEMPTS) {
+                                  webView.postDelayed(
+                                          () -> waitForImportedRoute(
+                                                  generation,
+                                                  nextAttempt),
+                                          UI_STEP_RETRY_MS);
+                                  return;
+                              }
+
+                              failMenuAutomation(
+                                      generation,
+                                      "Az importált útvonal nem jelent meg időben.");
+                          });
+              }
+          '''
+          web = replace_method(
+              web,
+              'private void waitForImportedRoute(',
+              new_wait_for_imported_route
+          )
+
+          stop_transfer_methods = r'''
+
+              private void waitForImportedRouteEdit(int generation) {
+                  waitForAndClickTextTarget(
+                          generation,
+                          0,
+                          "Szerkesztés",
+                          new String[]{
+                                  "szerkesztés", "szerkeszt", "edit",
+                                  "modifier", "bearbeiten"
+                          },
+                          true,
+                          1200L,
+                          () -> waitForImportedRouteMode(generation));
+              }
+
+              private void waitForImportedRouteMode(int generation) {
+                  waitForAndClickTextTarget(
+                          generation,
+                          0,
+                          "Útvonal szerkesztése",
+                          new String[]{
+                                  "útvonal", "route", "itinéraire"
+                          },
+                          false,
+                          1200L,
+                          () -> waitForSaveAsNew(generation));
+              }
+
+              private void waitForSaveAsNew(int generation) {
+                  waitForAndClickTextTarget(
+                          generation,
+                          0,
+                          "Mentés újként",
+                          new String[]{
+                                  "mentés újként", "mentés másként",
+                                  "save as new", "save as",
+                                  "enregistrer comme nouveau",
+                                  "als neu speichern"
+                          },
+                          true,
+                          900L,
+                          () -> waitForSaveAsNewCancel(generation));
+              }
+
+              private void waitForSaveAsNewCancel(int generation) {
+                  waitForAndClickTextTarget(
+                          generation,
+                          0,
+                          "A mentési ablak bezárása",
+                          new String[]{
+                                  "mégse", "megszakítás", "cancel",
+                                  "annuler", "abbrechen"
+                          },
+                          false,
+                          900L,
+                          () -> waitForRouteExport(generation));
+              }
+
+              private void waitForRouteExport(int generation) {
+                  waitForAndClickTextTarget(
+                          generation,
+                          0,
+                          "Exportálás",
+                          new String[]{
+                                  "exportálás", "export", "exporter",
+                                  "exportieren"
+                          },
+                          true,
+                          900L,
+                          () -> waitForSendStopsToDevice(generation));
+              }
+
+              private void waitForSendStopsToDevice(int generation) {
+                  waitForAndClickTextTarget(
+                          generation,
+                          0,
+                          "Megállók küldése az eszközre",
+                          new String[]{
+                                  "megállók küldése az eszközre",
+                                  "megállók küldése készülékre",
+                                  "send stops to device",
+                                  "envoyer les arrêts à l’appareil",
+                                  "envoyer les arrets a l'appareil",
+                                  "stopps an gerät senden",
+                                  "stopps an gerat senden"
+                          },
+                          true,
+                          1300L,
+                          () -> finishMenuAutomation(
+                                  generation,
+                                  "Az útvonal megállókkal elküldve a TomTom GO Expertnek."));
+              }
+          '''
+
+          final_brace = web.rfind('}')
+          if final_brace < 0:
+              raise SystemExit('A TomTomWebActivity osztály vége nem található.')
+          web = web[:final_brace] + stop_transfer_methods + '\n' + web[final_brace:]
+          web_path.write_text(web, encoding='utf-8')
+          PY
+
+      - name: Verify V115 stop-transfer implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAIN='app/src/main/java/hu/pocsaji/tomtomkiszolgalo/MainActivity.java'
+          SERVICE='app/src/main/java/hu/pocsaji/tomtomkiszolgalo/TomTomAccessibilityService.java'
+          WEB='app/src/main/java/hu/pocsaji/tomtomkiszolgalo/TomTomWebActivity.java'
+
+          grep -F 'rootProject.name = "TomTomKiszolgaloV115"' settings.gradle.kts
+          grep -F 'versionCode = 115' app/build.gradle.kts
+          grep -F 'versionName = "115"' app/build.gradle.kts
+          grep -F 'private static final String VERSION = "V115";' "$MAIN"
+          grep -F 'private static final String VERSION = "V115";' "$SERVICE"
+          grep -F 'TomTom saját böngésző V115' "$WEB"
+
+          grep -F 'waitForImportedRouteEdit' "$WEB"
+          grep -F 'waitForImportedRouteMode' "$WEB"
+          grep -F 'waitForSaveAsNew' "$WEB"
+          grep -F 'waitForSaveAsNewCancel' "$WEB"
+          grep -F 'waitForRouteExport' "$WEB"
+          grep -F 'waitForSendStopsToDevice' "$WEB"
+          grep -F 'send stops to device' "$WEB"
+          grep -F 'Az útvonal megállókkal elküldve a TomTom GO Expertnek.' "$WEB"
+
+          python <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          paths = [
+              Path('app/src/main/java/hu/pocsaji/tomtomkiszolgalo/MainActivity.java'),
+              Path('app/src/main/java/hu/pocsaji/tomtomkiszolgalo/TomTomAccessibilityService.java'),
+              Path('app/src/main/java/hu/pocsaji/tomtomkiszolgalo/TomTomWebActivity.java'),
+              Path('app/src/main/java/hu/pocsaji/tomtomkiszolgalo/TomTomCredentialStore.java'),
+              Path('app/src/main/java/hu/pocsaji/tomtomkiszolgalo/OpenAiVisionClient.java'),
+              Path('app/src/main/java/hu/pocsaji/tomtomkiszolgalo/TomTomGpxWriter.java'),
+          ]
+          for path in paths:
+              source = path.read_text(encoding='utf-8')
+              assert source.rstrip().endswith('}'), path
+              assert source.count('{') == source.count('}'), path
+
+          web = paths[2].read_text(encoding='utf-8')
+          assert web.count('private void waitForImportedRoute(') == 1
+          assert web.count('private void waitForImportedRouteEdit(') == 1
+          assert web.count('private void waitForImportedRouteMode(') == 1
+          assert web.count('private void waitForSaveAsNew(') == 1
+          assert web.count('private void waitForSaveAsNewCancel(') == 1
+          assert web.count('private void waitForRouteExport(') == 1
+          assert web.count('private void waitForSendStopsToDevice(') == 1
+          assert 'waitForRouteSyncMenuItem(generation' not in web.split(
+              'private void waitForImportedRoute(', 1
+          )[1].split('private void waitForRouteSyncMenuItem(', 1)[0]
+
+          ET.parse('app/src/main/AndroidManifest.xml')
+          ET.parse('app/src/main/res/xml/accessibility_service_config.xml')
+          print('V115_SEND_STOPS_AUDIT_OK')
+          PY
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle 8.13
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.13
+
+      - name: Prepare release signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_KEYSTORE_BASE64" || (echo "Missing ANDROID_KEYSTORE_BASE64" && exit 1)
+          test -n "$ANDROID_KEYSTORE_PASSWORD" || (echo "Missing ANDROID_KEYSTORE_PASSWORD" && exit 1)
+          test -n "$ANDROID_KEY_ALIAS" || (echo "Missing ANDROID_KEY_ALIAS" && exit 1)
+          test -n "$ANDROID_KEY_PASSWORD" || (echo "Missing ANDROID_KEY_PASSWORD" && exit 1)
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > release-key.jks
+          cat > keystore.properties <<EOF
+          storeFile=release-key.jks
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          keyPassword=$ANDROID_KEY_PASSWORD
+          EOF
+
+      - name: Build signed TomTom Kiszolgalo V115 APK and AAB
+        run: gradle assembleRelease bundleRelease --stacktrace
+
+      - name: Collect V115 release files
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          cp app/build/outputs/apk/release/app-release.apk artifact/TomTom_Kiszolgalo_V115.apk
+          cp app/build/outputs/bundle/release/app-release.aab artifact/TomTom_Kiszolgalo_V115.aab
+          ls -lah artifact
+
+      - name: Upload TomTom Kiszolgalo V115
+        uses: actions/upload-artifact@v4
+        with:
+          name: TomTom_Kiszolgalo_V115
+          path: |
+            artifact/TomTom_Kiszolgalo_V115.apk
+            artifact/TomTom_Kiszolgalo_V115.aab
+          if-no-files-found: error
